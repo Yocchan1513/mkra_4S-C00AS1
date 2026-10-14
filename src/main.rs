@@ -27,6 +27,7 @@ mod gr_i2c;
 mod http;
 mod i2c_lock;
 mod json;
+mod latm;
 mod remux4k;
 mod si;
 mod snapshot;
@@ -61,6 +62,7 @@ mkra — Mirakurun-compatible relay for the SHARP 4S-C00AS1
 
 USAGE:
   mkra serve [options]
+  mkra latm2adts --file <in.ts> --out <out.ts>
   mkra probe [options]
   mkra dump  --buffer <handle> --out <path> [--seconds <n>] [--reader <handle>|--passive]
   mkra graph [--watch <n>] [--sniff]
@@ -207,6 +209,9 @@ REMUX4K OPTIONS (BS4K MMT -> MPEG-TS, no recording required):
                         to this level (default 48; steady state is 9..14). This
                         is the guard that matters: a stalled tap starves the
                         product's decoder and blocks its own recovery.
+  --audio-latm          keep the AAC audio as LATM (stream_type 0x11). By default
+                        it is rewritten to ADTS (0x0F) without re-encoding,
+                        because TVTest only decodes ADTS.
   --dry-run             print every ioctl request and touch nothing
 
   Builds a private REMUX (me_type 0x0E) exactly as adsb's recording path does,
@@ -298,6 +303,11 @@ GR OPTIONS:
   or sem_init), issue the one fixed sequence, and report RF latch/ISDB-T lock.
   Live GR changes RF state; reboot before the next live hypothesis.
 
+LATM2ADTS:
+  Offline, runs anywhere: rewrite a recorded TS's LATM audio to ADTS the same
+  way `serve` does live (no re-encode). For recordings made with --audio-latm
+  or by an older mkra that TVTest plays without sound.
+
 COMMON:
   --dev-node <path>     driver node (default /dev/vixs/xcodedrv)
   -h, --help            this text
@@ -331,6 +341,7 @@ fn main() {
         "tsrec" => cmd_tsrec(&opts),
         "demux" => cmd_demux(&opts),
         "remux4k" => cmd_remux4k(&opts),
+        "latm2adts" => cmd_latm2adts(&opts),
         "tune4k" => cmd_tune4k(&opts),
         "gr" => cmd_gr(&opts),
         "gr-off" => cmd_gr_off(),
@@ -734,6 +745,8 @@ struct Options {
     remux4k_es_level_abort: u32,
     /// remux4k: skip the TSINFO side channel entirely.
     remux4k_no_tsinfo: bool,
+    /// remux4k: keep the audio as LATM instead of rewriting it to ADTS.
+    remux4k_latm: bool,
     /// serve: use the BS4K REMUX tap as the TS backend.
     remux4k_backend: bool,
     /// tune4k: advanced-BS service id to select.
@@ -827,6 +840,7 @@ impl Options {
             remux4k_stall_abort_ms: 5000,
             remux4k_es_level_abort: 48,
             remux4k_no_tsinfo: true,
+            remux4k_latm: false,
             remux4k_backend: false,
             sid: None,
             oid: 32,
@@ -897,6 +911,7 @@ impl Options {
                 "--es-level-abort" => o.remux4k_es_level_abort = parse_num(&value()?, a)? as u32,
                 "--no-tsinfo" => o.remux4k_no_tsinfo = true,
                 "--with-tsinfo" => o.remux4k_no_tsinfo = false,
+                "--audio-latm" => o.remux4k_latm = true,
                 "--remux4k" => o.remux4k_backend = true,
                 "--sid" => o.sid = Some(parse_num(&value()?, a)? as u16),
                 "--oid" => o.oid = parse_num(&value()?, a)? as u32,
@@ -1187,6 +1202,7 @@ fn cmd_serve(opts: &Options) -> i32 {
             with_tsinfo: !opts.remux4k_no_tsinfo,
             es_level_abort: opts.remux4k_es_level_abort,
             stall_abort_ms: opts.remux4k_stall_abort_ms,
+            adts: !opts.remux4k_latm,
             ..remux4k::TapConfig::default()
         };
         // Tuning is opt-in. With `--tune`, a request for another service asks
@@ -3303,6 +3319,7 @@ fn cmd_remux4k(opts: &Options) -> i32 {
         with_tsinfo: !opts.remux4k_no_tsinfo,
         es_level_abort: opts.remux4k_es_level_abort,
         stall_abort_ms: opts.remux4k_stall_abort_ms,
+        adts: !opts.remux4k_latm,
         ..remux4k::TapConfig::default()
     };
     match live_service {
@@ -3326,7 +3343,12 @@ fn cmd_remux4k(opts: &Options) -> i32 {
         }
     };
 
-    let mut psi = remux4k::PsiGenerator::new(tsid);
+    let audio_type = if opts.remux4k_latm {
+        remux4k::AUDIO_STREAM_TYPE as u8
+    } else {
+        latm::STREAM_TYPE_ADTS
+    };
+    let mut psi = remux4k::PsiGenerator::with_audio_type(tsid, audio_type);
     let deadline = Instant::now() + Duration::from_secs(opts.seconds);
     let mut next_psi = Instant::now();
     let (mut ts, mut sample) = (Vec::new(), Vec::new());
@@ -3394,6 +3416,45 @@ fn cmd_remux4k(opts: &Options) -> i32 {
     } else {
         1
     }
+}
+
+fn cmd_latm2adts(opts: &Options) -> i32 {
+    let (Some(input), Some(output)) = (opts.file.as_deref(), opts.out.as_deref()) else {
+        eprintln!("mkra: latm2adts needs --file <in.ts> and --out <out.ts>");
+        return 2;
+    };
+    let data = match std::fs::read(input) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("mkra: read {input}: {e}");
+            return 1;
+        }
+    };
+    let start = match (0..188.min(data.len())).find(|&i| {
+        (0..3).all(|k| data.get(i + k * 188) == Some(&0x47))
+    }) {
+        Some(s) => s,
+        None => {
+            eprintln!("mkra: {input}: no 188-byte TS framing found");
+            return 1;
+        }
+    };
+    let whole = (data.len() - start) / 188 * 188;
+    let mut rw = latm::AdtsRewriter::new();
+    let mut out = Vec::with_capacity(data.len() + data.len() / 50);
+    rw.process(&data[start..start + whole], &mut out);
+    if let Err(e) = std::fs::write(output, &out) {
+        eprintln!("mkra: write {output}: {e}");
+        return 1;
+    }
+    println!(
+        "latm2adts: {} PES converted, {} passed through, {} AAC frames, {} errors -> {output}",
+        rw.pes_converted,
+        rw.pes_passed,
+        rw.frames(),
+        rw.errors()
+    );
+    if rw.pes_converted > 0 { 0 } else { 1 }
 }
 
 /// Ask the product to change channel and wait for its own SI to agree.
