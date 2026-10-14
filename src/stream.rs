@@ -321,6 +321,11 @@ pub struct BrokerConfig {
     /// How long the pump keeps running after the last client leaves, so a
     /// client that reconnects immediately does not force a re-tune.
     pub linger: Duration,
+    /// How long a request for another channel waits for the current
+    /// session's clients to go away before it is refused as busy. A client
+    /// changing channel closes its old stream and opens the new one at once,
+    /// and the server only notices the close on its next write.
+    pub switch_grace: Duration,
 }
 
 impl Default for BrokerConfig {
@@ -329,9 +334,13 @@ impl Default for BrokerConfig {
             ring_bytes: 1024 * 1024, // ~250 ms at the 32 Mbit/s advanced-BS rate
             max_clients: 4,
             linger: Duration::from_secs(3),
+            switch_grace: Duration::from_secs(2),
         }
     }
 }
+
+/// Upper bound on waiting for a pre-empted session to tear its source down.
+const RELEASE_WAIT: Duration = Duration::from_secs(15);
 
 /// Builds a fresh `TsSource` for a channel. Returning a boxed trait object
 /// keeps the driver and the file backends interchangeable.
@@ -365,12 +374,9 @@ impl Broker {
         agent: String,
         url: String,
     ) -> Result<(Arc<Session>, Arc<Subscriber>), SubscribeError> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.lock_for(channel_key)?;
 
         if let Some(session) = state.as_ref() {
-            if session.channel_key != channel_key {
-                return Err(SubscribeError::Busy(session.channel_key.clone()));
-            }
             let session = Arc::clone(session);
             let mut subs = session.subscribers.lock().unwrap_or_else(|e| e.into_inner());
             if subs.len() >= self.cfg.max_clients {
@@ -406,6 +412,60 @@ impl Broker {
             .map_err(SubscribeError::Source)?;
 
         Ok((session, sub))
+    }
+
+    /// Lock the broker state once it is free for `channel_key`: either idle,
+    /// or already serving that channel.
+    ///
+    /// A session for another channel that has no live client left -- it is
+    /// lingering, or its last client has just hung up to change channel -- is
+    /// stopped, and this waits until its pump has torn the source down, so
+    /// the next source is never built while the old one still holds the
+    /// hardware. Before this, switching channel inside the linger window was
+    /// refused with 503 and only a client restart got the new channel.
+    fn lock_for(
+        &self,
+        channel_key: &str,
+    ) -> Result<std::sync::MutexGuard<'_, Option<Arc<Session>>>, SubscribeError> {
+        let grace_end = Instant::now() + self.cfg.switch_grace;
+        loop {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(current) = state.as_ref() else { return Ok(state) };
+            if current.channel_key == channel_key {
+                return Ok(state);
+            }
+            let current = Arc::clone(current);
+            drop(state);
+            let live = current.subscribers().iter().any(|s| !s.is_closed());
+            if live {
+                if Instant::now() >= grace_end {
+                    return Err(SubscribeError::Busy(current.channel_key.clone()));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            eprintln!(
+                "mkra: switching from {} to {channel_key}: releasing the idle session",
+                current.channel_key
+            );
+            current.stop();
+            let release_end = Instant::now() + RELEASE_WAIT;
+            loop {
+                let still = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .is_some_and(|s| Arc::ptr_eq(s, &current));
+                if !still {
+                    break;
+                }
+                if Instant::now() >= release_end {
+                    return Err(SubscribeError::Busy(current.channel_key.clone()));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
     }
 
     pub fn unsubscribe(&self, session: &Arc<Session>, sub: &Arc<Subscriber>) {
@@ -674,6 +734,7 @@ mod tests {
                 ring_bytes: 4096,
                 max_clients: 2,
                 linger: Duration::from_millis(50),
+                switch_grace: Duration::from_millis(100),
             },
             Box::new(|_| Ok(Box::new(Counting(100)) as Box<dyn TsSource>)),
         )
@@ -730,6 +791,48 @@ mod tests {
         ));
         b.unsubscribe(&s, &a);
         b.unsubscribe(&s, &bb);
+    }
+
+    #[test]
+    fn switching_channel_preempts_a_session_with_no_live_client() {
+        let b = Broker::new(
+            BrokerConfig {
+                ring_bytes: 4096,
+                max_clients: 2,
+                // Long enough that only pre-emption can explain the switch.
+                linger: Duration::from_secs(30),
+                switch_grace: Duration::from_millis(100),
+            },
+            Box::new(|_| Ok(Box::new(Counting(100)) as Box<dyn TsSource>)),
+        );
+        let (old, sub) = b
+            .subscribe("BS17_0", "a".into(), 0, "".into(), "/".into())
+            .unwrap();
+        b.unsubscribe(&old, &sub); // now lingering
+        let started = Instant::now();
+        let (new, sub2) = b
+            .subscribe("BS7_0", "b".into(), 0, "".into(), "/".into())
+            .expect("an idle session must not block a channel change");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(new.channel_key, "BS7_0");
+        assert!(!Arc::ptr_eq(&old, &new));
+        b.unsubscribe(&new, &sub2);
+    }
+
+    #[test]
+    fn switching_channel_preempts_a_client_that_already_hung_up() {
+        let b = test_broker();
+        let (old, sub) = b
+            .subscribe("BS17_0", "a".into(), 0, "".into(), "/".into())
+            .unwrap();
+        // Closed but not yet unsubscribed: the HTTP side has not noticed.
+        sub.close();
+        let (new, sub2) = b
+            .subscribe("BS7_0", "b".into(), 0, "".into(), "/".into())
+            .unwrap();
+        assert_eq!(new.channel_key, "BS7_0");
+        b.unsubscribe(&old, &sub);
+        b.unsubscribe(&new, &sub2);
     }
 
     #[test]

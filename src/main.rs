@@ -1377,6 +1377,7 @@ fn cmd_serve(opts: &Options) -> i32 {
             ring_bytes: opts.ring,
             max_clients: opts.max_clients,
             linger: Duration::from_secs(3),
+            switch_grace: Duration::from_secs(2),
         },
         factory,
     );
