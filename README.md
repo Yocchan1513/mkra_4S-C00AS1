@@ -16,7 +16,7 @@ TVTest / EPGStation ──HTTP──▶ mkra (4S-C00AS1 本体 :40772) ──▶
 > **このフォークについて**
 >
 > このリポジトリは [otti83/mkra_4S-C00AS1](https://github.com/otti83/mkra_4S-C00AS1) のフォークです。
-> 改良は `audio-adts` ブランチにあり、本家に対して次の2点を変更しています。
+> 改良は `audio-adts` ブランチにあり、本家に対して次の3点を変更しています。
 > 元のソフトウェアの著作権とライセンス（MIT）は本家の作者に帰属します。
 >
 > - **音声を ADTS で出力する**（TVTest で音が出るようにする）
@@ -31,6 +31,12 @@ TVTest / EPGStation ──HTTP──▶ mkra (4S-C00AS1 本体 :40772) ──▶
 >   TVTest でチャンネルを切り替えると `503 tuner busy` になり、TVTest を再起動しないと選局できませんでした。
 >   このフォークでは、別チャンネルが要求され、今のセッションに視聴中のクライアントがいなければ、
 >   古いセッションを止めて後片付けを待ってから新しいチャンネルを開きます。
+>
+> - **EPGStation を無改造でつなげるようにする**
+>   EPGStation が使う `mirakurun` クライアントは最初に `/api/docs` を読むため、本家では接続できず
+>   「check mirakurun」を繰り返していました。`/api/docs`、`/api/events`、mirakc 形式の `/events`（SSE）を追加し、
+>   番組表を読み直すたびに `epg.programs-updated` を送るようにしています。
+>   EPGStation 側は mkra を mirakc として扱い、通知のあったサービスの番組表を読み直します。
 >
 > ビルドと配備の手順は本家と同じです（下記の「導入」「ソースからビルドする」を参照）。
 > TVTest で 4K を快適に見るには、LAV Video Decoder などでハードウェアデコードを有効にしてください。

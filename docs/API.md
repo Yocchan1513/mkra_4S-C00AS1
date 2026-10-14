@@ -66,6 +66,9 @@ Mirakurun の `ServiceItemId` は `network_id`（11）＋ `service_id` を 5 桁
 | メソッド | パス | 内容 |
 |---|---|---|
 | GET | `/api/version` | バージョン |
+| GET | `/api/docs` | Mirakurun の OpenAPI 定義（operationId と引数のみ）。`mirakurun` npm クライアント（EPGStation が使用）が最初に読む |
+| GET | `/api/events` | 常に `[]`。番組表の更新は `/events` で通知する |
+| GET | `/events` | mirakc 形式の Server-Sent Events。番組表を読み直すたびに全サービス分の `epg.programs-updated` を送る |
 | GET | `/api/status` | サーバ状態 |
 | GET | `/api/tuners` `/api/tuners/0` | チューナー一覧。使用中かどうか、クライアント別のドロップ数 |
 | GET | `/api/channels` | チャンネル一覧 |

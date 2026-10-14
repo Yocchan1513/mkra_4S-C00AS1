@@ -48,6 +48,9 @@ pub struct AppState {
     /// EPG parsed from the product's own MMT-SI cache. Empty until
     /// `--epg-dir` is given and the box has actually acquired a schedule.
     pub epg: RwLock<SiDb>,
+    /// Bumped whenever the guide is reloaded or new sections are merged, so
+    /// `/events` can tell subscribers which services to re-read.
+    pub epg_gen: AtomicU64,
 }
 
 impl AppState {
@@ -65,6 +68,7 @@ impl AppState {
             tuning_enabled,
             backend,
             epg: RwLock::new(SiDb::new()),
+            epg_gen: AtomicU64::new(0),
         }
     }
 
@@ -125,6 +129,7 @@ impl AppState {
         if let Ok(mut guard) = self.epg.write() {
             *guard = db;
         }
+        self.epg_gen.fetch_add(1, Ordering::Relaxed);
         Ok(n)
     }
 
@@ -144,6 +149,9 @@ impl AppState {
         let mut accepted = 0;
         for c in chunks {
             accepted += db.ingest_ring(c);
+        }
+        if accepted > 0 {
+            self.epg_gen.fetch_add(1, Ordering::Relaxed);
         }
         (accepted, db.programs.len())
     }
@@ -421,7 +429,16 @@ pub enum Route {
     Json(u16, String),
     /// Open-ended TS body for the given channel key.
     Stream(String),
+    /// mirakc-style Server-Sent Events (`/events`).
+    Events,
 }
+
+/// Mirakurun's OpenAPI document, reduced to what its client library reads:
+/// paths, operationIds and parameters. The `mirakurun` npm client fetches
+/// `/api/docs` before every first call and resolves each operation through
+/// it, so without this EPGStation cannot talk to mkra at all. Derived from
+/// Mirakurun 3.9.0's api.yml and route definitions (Apache-2.0).
+const MIRAKURUN_DOCS: &str = include_str!("mirakurun_docs.json");
 
 pub fn route(state: &AppState, req: &Request) -> Route {
     let json_ok = |body: String| Route::Json(200, body);
@@ -444,6 +461,14 @@ pub fn route(state: &AppState, req: &Request) -> Route {
                 .str("version", MKRA_VERSION)
                 .str("api", "/api/version");
         })),
+
+        ["api", "docs"] => json_ok(MIRAKURUN_DOCS.to_string()),
+
+        // Mirakurun's event list. mkra keeps no event log; the guide is
+        // announced through `/events` instead.
+        ["api", "events"] => json_ok("[]".to_string()),
+
+        ["events"] => Route::Events,
 
         ["api", "version"] => json_ok(json::object(|o| {
             o.str("current", COMPAT_MIRAKURUN_VERSION)
@@ -597,6 +622,10 @@ pub fn handle(state: &AppState, req: &Request, out: &mut TcpStream) {
             stream(state, req, out, &key, head_only);
             return;
         }
+        Route::Events => {
+            events(state, out, head_only);
+            return;
+        }
     };
 
     if let Err(e) = result {
@@ -604,6 +633,71 @@ pub fn handle(state: &AppState, req: &Request, out: &mut TcpStream) {
         if e.kind() != std::io::ErrorKind::BrokenPipe {
             eprintln!("mkra: response failed for {}: {e}", req.path);
         }
+    }
+}
+
+// --- /events (mirakc-style SSE) ------------------------------------------
+
+const EVENTS_POLL: Duration = Duration::from_secs(1);
+const EVENTS_KEEPALIVE: Duration = Duration::from_secs(15);
+
+/// One `epg.programs-updated` record per service.
+fn epg_updated_events(state: &AppState) -> String {
+    let mut s = String::new();
+    for (_, svc) in state.table.services() {
+        s.push_str(&format!(
+            "event: epg.programs-updated\ndata: {{\"serviceId\":{}}}\n\n",
+            svc.item_id()
+        ));
+    }
+    s
+}
+
+/// Server-Sent Events in mirakc's shape.
+///
+/// EPGStation decides between its Mirakurun and mirakc code paths by
+/// whether `/api/config/server` exists. mkra does not have it, so EPGStation
+/// takes the mirakc path and keeps an EventSource on `/events`; when that
+/// fails it retries for ever and logs `disconnected mirakc event.`. While the
+/// source is open it re-reads only the services named in
+/// `epg.programs-updated`, so every guide change is announced for every
+/// service. EPGStation ignores events in the first second after the first
+/// one arrives, which is why a single primer is sent on connect.
+fn events(state: &AppState, out: &mut TcpStream, head_only: bool) {
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                Cache-Control: no-cache\r\nConnection: close\r\n\r\n";
+    if out.write_all(head.as_bytes()).and_then(|_| out.flush()).is_err() || head_only {
+        return;
+    }
+    let _ = out.set_write_timeout(Some(Duration::from_secs(10)));
+    let primer = state
+        .table
+        .services()
+        .next()
+        .map(|(_, s)| format!("event: epg.programs-updated\ndata: {{\"serviceId\":{}}}\n\n", s.item_id()))
+        .unwrap_or_else(|| ": mkra\n\n".to_string());
+    if out.write_all(primer.as_bytes()).and_then(|_| out.flush()).is_err() {
+        return;
+    }
+    let mut seen = state.epg_gen.load(Ordering::Relaxed);
+    let mut last_write = Instant::now();
+    loop {
+        std::thread::sleep(EVENTS_POLL);
+        let gen = state.epg_gen.load(Ordering::Relaxed);
+        let msg = if gen != seen {
+            seen = gen;
+            epg_updated_events(state)
+        } else if last_write.elapsed() >= EVENTS_KEEPALIVE {
+            // An SSE comment: ignored by EventSource, and the write is what
+            // tells us the client has gone.
+            ": keepalive\n\n".to_string()
+        } else {
+            continue;
+        };
+        if out.write_all(msg.as_bytes()).and_then(|_| out.flush()).is_err() {
+            return;
+        }
+        last_write = Instant::now();
     }
 }
 
@@ -765,6 +859,7 @@ pub fn render(state: &AppState, path: &str) -> (u16, String) {
     match route(state, &request(path)) {
         Route::Json(code, body) => (code, body),
         Route::Stream(key) => (200, key),
+        Route::Events => (200, "events".to_string()),
     }
 }
 
@@ -807,6 +902,52 @@ mod tests {
             }
         }
         depth == 0 && !in_str
+    }
+
+    #[test]
+    fn docs_resolve_every_operation_the_mirakurun_client_uses() {
+        let (code, body) = render(&state(), "/api/docs");
+        assert_eq!(code, 200);
+        assert!(is_balanced(&body));
+        assert!(body.contains(r#""basePath":"/api""#));
+        for op in [
+            "getChannels", "getServices", "getService", "getPrograms", "getProgram",
+            "getTuners", "getStatus", "checkVersion", "getServiceStream",
+            "getChannelStream", "getServiceStreamByChannel", "getServerConfig",
+        ] {
+            assert!(body.contains(&format!(r#""operationId":"{op}""#)), "missing {op}");
+        }
+        // The client spreads `path.parameters`: it must exist on every path.
+        let paths = body.matches(r#"":{"parameters":["#).count();
+        assert!(paths >= 25, "only {paths} paths carry a parameters array");
+        // Every "/..." string is a path key, except basePath.
+        assert_eq!(paths, body.matches(r#""/"#).count() - 1);
+    }
+
+    #[test]
+    fn events_routes_exist() {
+        let st = state();
+        let (code, body) = render(&st, "/api/events");
+        assert_eq!((code, body.as_str()), (200, "[]"));
+        let req = Request {
+            method: "GET".into(),
+            path: "/events".into(),
+            query: Vec::new(),
+            headers: Vec::new(),
+            peer: "test".into(),
+        };
+        assert!(matches!(route(&st, &req), Route::Events));
+    }
+
+    #[test]
+    fn guide_changes_bump_the_event_generation() {
+        let st = state();
+        let before = st.epg_gen.load(Ordering::Relaxed);
+        st.merge_ring_si(&[]);
+        assert_eq!(st.epg_gen.load(Ordering::Relaxed), before, "nothing merged, no event");
+        let ev = epg_updated_events(&st);
+        assert_eq!(ev.matches("event: epg.programs-updated").count(), st.table.services().count());
+        assert!(ev.contains(r#"data: {"serviceId":1100101}"#));
     }
 
     #[test]
