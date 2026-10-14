@@ -85,15 +85,12 @@ impl AppState {
     /// Re-read the product's SI cache.
     ///
     /// `adsb` rewrites these files as it acquires tables, so this is called on
-    /// a timer rather than once at startup. A whole rebuild is cheap compared
-    /// with tracking per-file versions, and it means a stale EPG can never
-    /// outlive the file it came from.
+    /// a timer rather than once at startup. The files are merged into the
+    /// guide rather than replacing it; see [`merge_epg_slabs`](Self::merge_epg_slabs).
     ///
     /// The 8.4 MB schedule slab is the only large read; everything else is
-    /// 8-40 KB. Returns the number of programs after the rebuild.
+    /// 8-40 KB. Returns the number of programs after the merge.
     pub fn reload_epg(&self, dir: &str) -> std::io::Result<usize> {
-        // Order matters only in that the NIT and SDT give names the programs
-        // are looked up against; a full rebuild makes it moot.
         const FILES: [&str; 7] = [
             "AdsbSiTlvNitActual.dat",
             "AdsbSiMhSdtActual.dat",
@@ -101,36 +98,48 @@ impl AppState {
             "AdsbSiMhTot.dat",
             "AdsbSiMhEitPF.dat",
             "AdsbSiMhEitSch.dat",
-            // Extended schedule (table_id 0x94..0x9B) carries the events the
-            // basic slab does not; without it the guide has holes.
             "AdsbSiMhEitSchEx.dat",
         ];
-        let mut db = SiDb::new();
-        let mut read_any = false;
+        let mut slabs = Vec::new();
         for f in FILES {
             let path = format!("{}/{}", dir.trim_end_matches('/'), f);
-            match std::fs::read(&path) {
-                Ok(bytes) => {
-                    db.ingest(&bytes);
-                    read_any = true;
-                }
-                // A missing or unreadable table is normal: the box only writes
-                // one once it has received it.
-                Err(_) => continue,
+            if let Ok(bytes) = std::fs::read(&path) {
+                slabs.push(bytes);
             }
         }
-        if !read_any {
+        if slabs.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("no Adsb*.dat readable under {dir}"),
             ));
         }
-        let n = db.programs.len();
-        if let Ok(mut guard) = self.epg.write() {
-            *guard = db;
+        Ok(self.merge_epg_slabs(&slabs, sys::unix_time_ms() as i64))
+    }
+
+    /// Fold the product's cache files into the guide.
+    ///
+    /// `adsb` rewrites /tmp/adsb only for the service it is presenting, so
+    /// the files hold one channel's schedule at a time. Replacing the guide
+    /// with them on every refresh (as this used to) meant the guide only ever
+    /// showed the channel the box was on -- and a client that re-reads every
+    /// service then deleted everything else. Merging keeps each channel's
+    /// schedule once it has been seen; events are keyed by programme id, so a
+    /// re-sent event is an update. Programmes that ended over an hour ago are
+    /// dropped so the guide does not grow without bound.
+    pub fn merge_epg_slabs(&self, slabs: &[Vec<u8>], now_ms: i64) -> usize {
+        let Ok(mut db) = self.epg.write() else {
+            return 0;
+        };
+        for s in slabs {
+            db.ingest(s);
         }
+        let cutoff = now_ms - 3_600_000;
+        db.programs
+            .retain(|_, p| p.start_at_ms + p.duration_ms.max(0) >= cutoff);
+        let n = db.programs.len();
+        drop(db);
         self.epg_gen.fetch_add(1, Ordering::Relaxed);
-        Ok(n)
+        n
     }
 
     /// Merge SI read straight off the driver's section rings into the EPG.
@@ -937,6 +946,29 @@ mod tests {
             peer: "test".into(),
         };
         assert!(matches!(route(&st, &req), Route::Events));
+    }
+
+    #[test]
+    fn guide_keeps_earlier_channels_and_drops_ended_programmes() {
+        let st = state();
+        let eit_pf = include_bytes!("../testdata/mh_eit_pf.bin").to_vec();
+        let eit_sch = include_bytes!("../testdata/mh_eit_sched.bin").to_vec();
+        // Pick "now" inside the captured schedule so nothing is pruned yet.
+        let first = {
+            let mut db = SiDb::new();
+            db.ingest(&eit_sch);
+            db.ingest(&eit_pf);
+            db.programs.values().map(|p| p.start_at_ms).min().unwrap()
+        };
+        let n1 = st.merge_epg_slabs(&[eit_sch.clone(), eit_pf.clone()], first);
+        assert!(n1 >= 2, "got {n1}");
+        // The box moved to another channel and its cache files no longer
+        // carry these events: they must survive.
+        let n2 = st.merge_epg_slabs(&[], first);
+        assert_eq!(n2, n1);
+        // A day after everything has ended they are gone.
+        let n3 = st.merge_epg_slabs(&[], first + 30 * 24 * 3_600_000);
+        assert_eq!(n3, 0);
     }
 
     #[test]
