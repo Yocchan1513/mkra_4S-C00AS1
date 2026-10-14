@@ -122,7 +122,7 @@ Select it on the box first — mkra does not tune yet.
 
 - 188 バイト MPEG-TS（本体からは 192 バイト TTS で出るので、mkra が剥がしています）
 - PAT / PMT は再構成器が生成し、**実サービスを名乗ります**（例: TSID=45170、program=141）
-- PMT: PCR `0x1001`、HEVC `0x1011`、AAC-LATM `0x1100`
+- PMT: PCR `0x1001`、HEVC `0x1011`、AAC-ADTS `0x1100`（stream_type 0x0F。`--audio-latm` 指定時は LATM / 0x11）
 - 実測: 60 秒連続 216,976,064 バイト（28.9 Mbps）、CC エラー 0
 
 ```

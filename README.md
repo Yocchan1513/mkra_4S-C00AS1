@@ -5,12 +5,35 @@ SHARP の 4K チューナー **4S-C00AS1** の上で直接動く、単一の静�
 Mirakurun 互換の HTTP API で配信します。TVTest や EPGStation からそのまま使えます。
 
 ```
-TVTest / EPGStation ──HTTP──▶ mkra (4S-C00AS1 本体 :40772) ──▶ MPEG-TS (HEVC + AAC-LATM)
+TVTest / EPGStation ──HTTP──▶ mkra (4S-C00AS1 本体 :40772) ──▶ MPEG-TS (HEVC + AAC-ADTS)
 ```
 
 録画機能は使いません。本体が視聴のために組んでいる MMT デマルチプレクサの出力に、
 **もう一つ MPEG-TS 再構成器をぶら下げているだけ**です。仕組みは
 [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) を読んでください。
+
+> [!NOTE]
+> **このフォークについて**
+>
+> このリポジトリは [otti83/mkra_4S-C00AS1](https://github.com/otti83/mkra_4S-C00AS1) のフォークです。
+> 改良は `audio-adts` ブランチにあり、本家に対して次の2点を変更しています。
+> 元のソフトウェアの著作権とライセンス（MIT）は本家の作者に帰属します。
+>
+> - **音声を ADTS で出力する**（TVTest で音が出るようにする）
+>   本家は音声を AAC-LATM（stream_type 0x11）のまま出すため、TVTest では映像だけ映って音が出ません。
+>   TVTest が扱えるのは、従来の放送と同じ AAC-ADTS（0x0F）だけだからです。
+>   このフォークでは再エンコードせずに LATM を ADTS へ包み直し、PMT の stream_type も 0x0F に書き換えます。
+>   PES ヘッダ（PTS）はそのまま残すので、音ズレは起きません。実機で TVTest の音声出力を確認済みです。
+>   元の LATM のまま出したい場合は `serve` に `--audio-latm` を付けてください。
+>   録画済みの TS を変換する `mkra latm2adts --file in.ts --out out.ts` も追加しています（PC 上でも動きます）。
+> - **チャンネル切り替えで 503 にならないようにする**
+>   本家は最後のクライアントが切断したあとも 3 秒間セッションを保持するため、
+>   TVTest でチャンネルを切り替えると `503 tuner busy` になり、TVTest を再起動しないと選局できませんでした。
+>   このフォークでは、別チャンネルが要求され、今のセッションに視聴中のクライアントがいなければ、
+>   古いセッションを止めて後片付けを待ってから新しいチャンネルを開きます。
+>
+> ビルドと配備の手順は本家と同じです（下記の「導入」「ソースからビルドする」を参照）。
+> TVTest で 4K を快適に見るには、LAV Video Decoder などでハードウェアデコードを有効にしてください。
 
 ---
 
@@ -20,7 +43,7 @@ TVTest / EPGStation ──HTTP──▶ mkra (4S-C00AS1 本体 :40772) ──▶
 
 | | |
 |---|---|
-| ✅ **BS4K（新4K衛星放送）の MPEG-TS 取り出し** | HEVC Main10 / 3840×2160 / BT.2020 HLG + AAC-LATM、約 29 Mbps |
+| ✅ **BS4K（新4K衛星放送）の MPEG-TS 取り出し** | HEVC Main10 / 3840×2160 / BT.2020 HLG + AAC（ADTS。`--audio-latm` で LATM）、約 29 Mbps |
 | ✅ **平文で出る** | 復号は本体の ACAS が済ませています。mkra は復号も鍵の操作も**していません** |
 | ✅ Mirakurun 互換 API | TVTest / BonDriver_Mirakurun / EPGStation から利用可 |
 | ✅ EPG（番組表） | 本体の MMT-SI キャッシュから 300 番組級。日本語タイトル付き |
