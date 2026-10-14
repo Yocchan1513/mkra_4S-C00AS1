@@ -103,7 +103,19 @@ const fn sub(cmd: c_int, sub: c_int) -> c_int {
     (sub << 16) | cmd
 }
 
+/// Per-ioctl tracing. It was unconditional, and on the streaming path it
+/// writes two lines per driver read (~50 lines/s, ~30 MB/h) into a log that
+/// `deploy.py` keeps on tmpfs: a long recording ate the box's RAM. Now opt-in
+/// with `MKRA_TRACE_IOCTL=1`.
+fn trace_ioctls() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MKRA_TRACE_IOCTL").is_some_and(|v| v != "0"))
+}
+
 fn log_raw_words(label: &str, words: &[u32]) {
+    if !trace_ioctls() {
+        return;
+    }
     eprintln!(
         "xcdrv: t_ms={} {label} raw words={words:08x?}",
         sys::unix_time_ms()
